@@ -137,7 +137,7 @@ $latestTodayResult = mysqli_query($conn, $latestTodaySql);
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Helmet Detection Dashboard</title>
 
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="style.css?v=2">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 
@@ -172,27 +172,47 @@ $latestTodayResult = mysqli_query($conn, $latestTodaySql);
     </div>
 
     <div class="cards">
-        <div class="card">
-            <p>ตรวจจับวันนี้</p>
+
+    <div class="card">
+        <p>ตรวจพบรถมอเตอร์ไซค์วันนี้</p>
+
+        <div class="card-number">
             <h2><?php echo $todayTotal; ?></h2>
-        </div>
-
-        <div class="card green">
-            <p>พบผู้สวมหมวก</p>
-            <h2><?php echo $todayHelmet; ?></h2>
-        </div>
-
-        <div class="card red">
-            <p>พบผู้ไม่สวมหมวก</p>
-            <h2><?php echo $todayNoHelmet; ?></h2>
-        </div>
-
-        <div class="card blue">
-            <p>ช่วงเวลาที่พบมากที่สุด</p>
-            <h2 class="peak-hour"><?php echo $peakHour; ?></h2>
-            <small><?php echo $peakTotal; ?> รายการ</small>
+            <span>คัน</span>
         </div>
     </div>
+
+    <div class="card green">
+        <p>พบผู้สวมหมวก</p>
+
+        <div class="card-number">
+            <h2><?php echo $todayHelmet; ?></h2>
+            <span>คน</span>
+        </div>
+    </div>
+
+    <div class="card red">
+        <p>พบผู้ไม่สวมหมวก</p>
+
+        <div class="card-number">
+            <h2><?php echo $todayNoHelmet; ?></h2>
+            <span>คน</span>
+        </div>
+    </div>
+
+    <div class="card blue">
+        <p>ช่วงเวลาที่พบมากที่สุด</p>
+
+        <h2 class="peak-hour">
+            <?php echo $peakHour; ?>
+        </h2>
+
+        <small>
+            <?php echo $peakTotal; ?> รายการ
+        </small>
+    </div>
+
+</div>
 
     <!-- กราฟ -->
     <div class="chart-grid">

@@ -19,7 +19,7 @@ app = Flask(__name__)
 # ==========================
 HELMET_MODEL_PATH = "runs/detect/runs/helmet_model_gpu/weights/best.pt"
 PLATE_MODEL_PATH = "runs/detect/runs/plate_model_gpu/weights/best.pt"
-
+MOTORCYCLE_MODEL_PATH = ("runs/detect/runs/motorcycle_model_gpu/weights/best.pt")
 
 # ==========================
 # ตั้งค่ากล้อง / ประสิทธิภาพ
@@ -28,6 +28,17 @@ CAMERA_INDEX = 0
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CAMERA_FPS = 30
+
+# ==========================
+# ตั้งค่าระบบตรวจจับมอเตอร์ไซค์
+# ==========================
+MOTORCYCLE_CONF = 0.50
+MOTORCYCLE_IMGSZ = 640
+
+# ขยายกรอบมอเตอร์ไซค์ขึ้นด้านบนเพื่อให้ครอบคลุมศีรษะคนขี่
+RIDER_PADDING_TOP = 0.80
+RIDER_PADDING_SIDE = 0.20
+RIDER_PADDING_BOTTOM = 0.15
 
 # YOLO หมวกทำงานที่ 640 แม้กล้องเป็น 720p
 HELMET_IMGSZ = 640
@@ -90,14 +101,40 @@ def add_cors_headers(response):
 # ==========================
 # โหลดโมเดล / OCR
 # ==========================
-helmet_model = YOLO(HELMET_MODEL_PATH).to("cuda")
-plate_model = YOLO(PLATE_MODEL_PATH).to("cuda")
-reader = easyocr.Reader(["th", "en"], gpu=True)
+# ==========================
+# โหลดโมเดล / OCR
+# ==========================
+motorcycle_model = YOLO(
+    MOTORCYCLE_MODEL_PATH
+).to("cuda")
 
-print("Helmet model classes =", helmet_model.names)
-print("Plate model classes =", plate_model.names)
+helmet_model = YOLO(
+    HELMET_MODEL_PATH
+).to("cuda")
 
+plate_model = YOLO(
+    PLATE_MODEL_PATH
+).to("cuda")
 
+reader = easyocr.Reader(
+    ["th", "en"],
+    gpu=True
+)
+
+print(
+    "Motorcycle model classes =",
+    motorcycle_model.names
+)
+
+print(
+    "Helmet model classes =",
+    helmet_model.names
+)
+
+print(
+    "Plate model classes =",
+    plate_model.names
+)
 # ==========================
 # เปิดกล้อง
 # ==========================
@@ -252,6 +289,50 @@ def normalize_class_name(class_name):
     name = name.replace("-", " ")
     return " ".join(name.split())
 
+def get_rider_roi(frame, motorcycle_box):
+    frame_height, frame_width = frame.shape[:2]
+
+    x1 = int(motorcycle_box["x1"])
+    y1 = int(motorcycle_box["y1"])
+    x2 = int(motorcycle_box["x2"])
+    y2 = int(motorcycle_box["y2"])
+
+    width = x2 - x1
+    height = y2 - y1
+
+    roi_x1 = max(
+        0,
+        int(x1 - width * RIDER_PADDING_SIDE)
+    )
+    roi_y1 = max(
+        0,
+        int(y1 - height * RIDER_PADDING_TOP)
+    )
+    roi_x2 = min(
+        frame_width,
+        int(x2 + width * RIDER_PADDING_SIDE)
+    )
+    roi_y2 = min(
+        frame_height,
+        int(y2 + height * RIDER_PADDING_BOTTOM)
+    )
+
+    if roi_x2 <= roi_x1 or roi_y2 <= roi_y1:
+        return None, None
+
+    rider_roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+
+    if rider_roi.size == 0:
+        return None, None
+
+    roi_coords = {
+        "x1": roi_x1,
+        "y1": roi_y1,
+        "x2": roi_x2,
+        "y2": roi_y2
+    }
+
+    return rider_roi, roi_coords
 
 def is_valid_helmet_box_coords(x1, y1, x2, y2, frame_width, frame_height):
     width = x2 - x1
@@ -547,7 +628,33 @@ def process_event_worker():
 
         finally:
             event_queue.task_done()
+def draw_motorcycle_box(frame, detection):
+    x1 = int(detection["x1"])
+    y1 = int(detection["y1"])
+    x2 = int(detection["x2"])
+    y2 = int(detection["y2"])
 
+    confidence = detection["confidence"]
+    label = f"Motorcycle {confidence:.2f}"
+    color = (255, 120, 0)
+
+    cv2.rectangle(
+        frame,
+        (x1, y1),
+        (x2, y2),
+        color,
+        2
+    )
+
+    cv2.putText(
+        frame,
+        label,
+        (x1, max(20, y1 - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        color,
+        2
+    )
 
 # ==========================
 # Helmet Detection Worker
@@ -567,114 +674,250 @@ def helmet_detection_worker():
             continue
 
         frame_height, frame_width = raw_frame.shape[:2]
+
         detections = []
-        no_helmet_confidence = 0.0
-        with_helmet_confidence = 0.0
+        motorcycle_detections = []
+        events_to_save = []
 
         try:
-            results = helmet_model(
+            # ==========================
+            # 1. ตรวจจับมอเตอร์ไซค์
+            # ==========================
+            motorcycle_results = motorcycle_model(
                 raw_frame,
-                conf=DETECT_CONF,
-                imgsz=HELMET_IMGSZ,
+                conf=MOTORCYCLE_CONF,
+                imgsz=MOTORCYCLE_IMGSZ,
                 verbose=False
             )
 
-            for result in results:
+            for result in motorcycle_results:
                 if result.boxes is None:
                     continue
 
                 for box in result.boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    cls_id = int(box.cls[0])
 
-                    if not is_valid_helmet_box_coords(
-                        x1,
-                        y1,
-                        x2,
-                        y2,
-                        frame_width,
-                        frame_height
+                    motorcycle_class = normalize_class_name(
+                        motorcycle_model.names[cls_id]
+                    )
+
+                    motorcycle_confidence = float(box.conf[0])
+
+                    # รองรับชื่อ Class หลายแบบ
+                    if motorcycle_class not in (
+                        "motorcycle",
+                        "motorbike",
+                        "motor cycle"
                     ):
                         continue
 
-                    cls_id = int(box.cls[0])
-                    class_name = helmet_model.names[cls_id]
-                    confidence = float(box.conf[0])
+                    mx1, my1, mx2, my2 = map(
+                        int,
+                        box.xyxy[0]
+                    )
 
-                    if class_name not in ("With Helmet", "Without Helmet"):
+                    if mx2 <= mx1 or my2 <= my1:
                         continue
 
-                    detection = {
-                        "x1": x1,
-                        "y1": y1,
-                        "x2": x2,
-                        "y2": y2,
-                        "class_name": class_name,
-                        "confidence": confidence
+                    motorcycle_detection = {
+                        "x1": mx1,
+                        "y1": my1,
+                        "x2": mx2,
+                        "y2": my2,
+                        "class_name": "Motorcycle",
+                        "confidence": motorcycle_confidence
                     }
-                    detections.append(detection)
 
-                    if class_name == "Without Helmet":
-                        no_helmet_confidence = max(
-                            no_helmet_confidence,
-                            confidence
-                        )
-                    else:
-                        with_helmet_confidence = max(
-                            with_helmet_confidence,
-                            confidence
+                    motorcycle_detections.append(
+                        motorcycle_detection
+                    )
+
+                    # ==========================
+                    # 2. ขยายพื้นที่รถและคนขี่
+                    # ==========================
+                    rider_roi, roi_coords = get_rider_roi(
+                        raw_frame,
+                        motorcycle_detection
+                    )
+
+                    if rider_roi is None:
+                        continue
+
+                    roi_height, roi_width = rider_roi.shape[:2]
+
+                    # ==========================
+                    # 3. ตรวจหมวกเฉพาะ Rider ROI
+                    # ==========================
+                    helmet_results = helmet_model(
+                        rider_roi,
+                        conf=DETECT_CONF,
+                        imgsz=HELMET_IMGSZ,
+                        verbose=False
+                    )
+
+                    best_helmet_detection = None
+
+                    for helmet_result in helmet_results:
+                        if helmet_result.boxes is None:
+                            continue
+
+                        for helmet_box in helmet_result.boxes:
+                            hx1, hy1, hx2, hy2 = map(
+                                int,
+                                helmet_box.xyxy[0]
+                            )
+
+                            if not is_valid_helmet_box_coords(
+                                hx1,
+                                hy1,
+                                hx2,
+                                hy2,
+                                roi_width,
+                                roi_height
+                            ):
+                                continue
+
+                            helmet_cls_id = int(
+                                helmet_box.cls[0]
+                            )
+
+                            helmet_class_name = (
+                                helmet_model.names[
+                                    helmet_cls_id
+                                ]
+                            )
+
+                            helmet_confidence = float(
+                                helmet_box.conf[0]
+                            )
+
+                            if helmet_class_name not in (
+                                "With Helmet",
+                                "Without Helmet"
+                            ):
+                                continue
+
+                            # แปลงพิกัดจาก ROI กลับเป็นภาพเต็ม
+                            full_x1 = roi_coords["x1"] + hx1
+                            full_y1 = roi_coords["y1"] + hy1
+                            full_x2 = roi_coords["x1"] + hx2
+                            full_y2 = roi_coords["y1"] + hy2
+
+                            helmet_detection = {
+                                "x1": full_x1,
+                                "y1": full_y1,
+                                "x2": full_x2,
+                                "y2": full_y2,
+                                "class_name": helmet_class_name,
+                                "confidence": helmet_confidence,
+                                "motorcycle_box": motorcycle_detection
+                            }
+
+                            detections.append(
+                                helmet_detection
+                            )
+
+                            # เลือกผลหมวกที่ Confidence สูงที่สุด
+                            # ของมอเตอร์ไซค์คันนี้
+                            if (
+                                best_helmet_detection is None
+                                or helmet_confidence
+                                > best_helmet_detection[
+                                    "confidence"
+                                ]
+                            ):
+                                best_helmet_detection = (
+                                    helmet_detection
+                                )
+
+                    # ==========================
+                    # 4. สร้าง Event แยกตามรถแต่ละคัน
+                    # ==========================
+                    if (
+                        best_helmet_detection is not None
+                        and best_helmet_detection[
+                            "confidence"
+                        ] >= SAVE_CONF
+                    ):
+                        events_to_save.append(
+                            best_helmet_detection
                         )
 
         except Exception as error:
-            print("Helmet detection error:", error)
+            print(
+                "Motorcycle/Helmet detection error:",
+                error
+            )
             time.sleep(0.10)
             continue
 
         now_time = time.time()
 
-        # วาดกรอบลงบน "เฟรมเดียวกับที่ YOLO เพิ่งตรวจ"
-        # ห้ามนำ boxes นี้ไปวาดทับ latest_raw_frame ซึ่งเป็นภาพคนละเวลา
-        # เพราะรถเคลื่อนที่เร็วจะทำให้กรอบเหลื่อม / ดูแลค
+        # ==========================
+        # 5. วาดกรอบ Live Feed
+        # ==========================
         detected_display_frame = raw_frame.copy()
+
+        # วาดกรอบมอเตอร์ไซค์
+        for motorcycle in motorcycle_detections:
+            draw_motorcycle_box(
+                detected_display_frame,
+                motorcycle
+            )
+
+        # วาดกรอบหมวก
         for detection in detections:
-            draw_detection_box(detected_display_frame, detection)
+            draw_detection_box(
+                detected_display_frame,
+                detection
+            )
 
         with detection_lock:
             latest_boxes = detections
             latest_boxes_updated_at = now_time
-            latest_detection_frame = detected_display_frame
-            latest_detection_frame_updated_at = now_time
-
-        # สร้างภาพมีกรอบเฉพาะสำหรับเก็บ Evidence
-        # บันทึกทั้ง With Helmet และ Without Helmet
-        # แต่ OCR / ตรวจป้าย ทำเฉพาะ Without Helmet เท่านั้น
-        events_to_save = []
-
-        if no_helmet_confidence >= SAVE_CONF:
-            events_to_save.append(
-                ("Without Helmet", no_helmet_confidence)
+            latest_detection_frame = (
+                detected_display_frame
+            )
+            latest_detection_frame_updated_at = (
+                now_time
             )
 
-        if with_helmet_confidence >= SAVE_CONF:
-            events_to_save.append(
-                ("With Helmet", with_helmet_confidence)
-            )
-
-        # ให้เหตุการณ์ไม่สวมหมวกมีความสำคัญก่อน
+        # ==========================
+        # 6. ให้ Without Helmet สำคัญก่อน
+        # ==========================
         events_to_save.sort(
-            key=lambda item: item[0] != "Without Helmet"
+            key=lambda item:
+            item["class_name"] != "Without Helmet"
         )
 
-        for helmet_status, helmet_confidence in events_to_save:
+        # ==========================
+        # 7. ส่ง Event ไป Worker
+        # ==========================
+        for event in events_to_save:
+            helmet_status = event["class_name"]
+            helmet_confidence = event["confidence"]
+            motorcycle_box = event["motorcycle_box"]
+
             if (
-                now_time - last_save_times[helmet_status]
-                < SAVE_INTERVAL
+                now_time - last_save_times[
+                    helmet_status
+                ] < SAVE_INTERVAL
             ):
                 continue
 
             evidence_frame = raw_frame.copy()
 
-            for detection in detections:
-                draw_detection_box(evidence_frame, detection)
+            # วาดกรอบรถคันที่เป็น Event
+            draw_motorcycle_box(
+                evidence_frame,
+                motorcycle_box
+            )
+
+            # วาดกรอบหมวกเฉพาะ Event นี้
+            draw_detection_box(
+                evidence_frame,
+                event
+            )
 
             try:
                 event_queue.put_nowait(
@@ -687,11 +930,16 @@ def helmet_detection_worker():
                     )
                 )
 
-                last_save_times[helmet_status] = now_time
+                last_save_times[
+                    helmet_status
+                ] = now_time
+
                 print(
                     "ส่งเหตุการณ์:",
                     helmet_status,
-                    f"{helmet_confidence:.2%}"
+                    f"{helmet_confidence:.2%}",
+                    "Motorcycle:",
+                    f"{motorcycle_box['confidence']:.2%}"
                 )
 
             except Full:
@@ -700,7 +948,7 @@ def helmet_detection_worker():
                     "ข้ามเหตุการณ์นี้ชั่วคราว"
                 )
 
-            # Queue มีขนาด 1 จึงส่งได้ทีละหนึ่งเหตุการณ์
+            # Queue มีขนาด 1
             break
 
         elapsed = time.time() - loop_started_at
@@ -708,8 +956,7 @@ def helmet_detection_worker():
 
         if sleep_time > 0:
             time.sleep(sleep_time)
-
-
+            
 # ==========================
 # เริ่ม Background Workers เพียงครั้งเดียว
 # ==========================
